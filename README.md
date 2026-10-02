@@ -11,13 +11,18 @@ One container, one language, two endpoints: live WebSocket streaming and offline
 # Build
 docker build -t s2t-malayalam .
 
-# Run — mount model files at runtime
+# Run — the model is baked into the image; same hardening as production
 docker run -d \
-  -p 6006:8000 \
-  -v "$PWD/models":/models:ro \
+  -p 6006:6006 \
+  --read-only --cap-drop=ALL --security-opt no-new-privileges \
   --name s2t-malayalam \
   s2t-malayalam
 ```
+
+The image is a two-stage build: packages are installed on `python:3.13-slim-trixie`
+and copied onto distroless `python3-debian13` (no shell, no package manager, no
+pip, non-root uid 65532). About 210 MB plus the 72 MB model, versus 309 MB
+without the model for the previous `python:3.12-slim` image.
 
 ### Without Docker
 
@@ -39,7 +44,7 @@ models/
     tokens.txt
 ```
 
-> Model binaries are not committed to this repo. Obtain them separately and mount or place them locally.
+The Docker build copies `models/malayalam/` into the image at `/models/malayalam`.
 
 ## API
 
@@ -89,12 +94,34 @@ curl http://localhost:6006/metrics  # Prometheus
 | `S2T_MAX_STREAMS` | `40` | max concurrent live streams |
 | `S2T_MAX_OFFLINE` | `8` | max concurrent offline files |
 | `S2T_PROVIDER` | `cpu` | `cuda` requires a CUDA sherpa-onnx build |
+| `S2T_PORT` | `8000` (`6006` in Docker) | listen port (Cloud Run sets `8080`) |
+| `S2T_MAX_UPLOAD_MB` | `100` | per file; Cloud Run caps a whole request at 32 MB, so production uses `30` |
+| `S2T_CORS_ORIGIN_REGEX` | empty | browser origins allowed (CORS + WebSocket `Origin` check), full-match regex; empty disables both |
+
+`/docs`, `/redoc` and `/openapi.json` are disabled.
+
+## Deployment
+
+Production runs on Cloud Run as `stt-malayalam`, behind
+`https://stt-agent.chatbucket.chat/stt-malayalam` (global HTTPS load balancer +
+Cloud Armor WAF, Google-managed certificate). The infrastructure is Terraform in
+[gke-infra-terraform](https://github.com/nandak99-coin/gke-infra-terraform)
+(`modules/stt-cloudrun`, `envs/prod/stt.tf`); only `/stt-malayalam/v1/stream`,
+`/stt-malayalam/v1/transcribe` and `/stt-malayalam/health` are reachable, and only from
+the allowed origins.
+
+1. **GCP Build & Push** builds, smoke-tests (read-only, no capabilities,
+   transcribes `tests/sample.wav`) and Trivy-scans the image on every push and
+   pull request, and pushes it to Artifact Registry as `<short sha>` on `main`.
+2. **GCP Deploy (Cloud Run)** (manual, `production` environment) rolls that tag
+   out; traffic moves only once the new revision passes its startup probe, and
+   goes back to the previous revision if the public health check fails.
+
+```
+wss://stt-agent.chatbucket.chat/stt-malayalam/v1/stream?sample_rate=16000
+curl -H 'Origin: https://todozee.chatbucket.chat' -F files=@audio.wav https://stt-agent.chatbucket.chat/stt-malayalam/v1/transcribe
+```
 
 ## Health check
 
-Docker polls `GET /health` every 15 s (60 s start grace). Check container health:
-
-```bash
-docker inspect --format='{{.State.Health.Status}}' s2t-malayalam
-# healthy
-```
+`GET /health` (liveness + readiness). Cloud Run probes it; locally use `make health`.
